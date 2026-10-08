@@ -1,0 +1,1012 @@
+--[[
+    ╔══════════════════════════════════════════════════════════╗
+    ║                    ZAZAK HUB - LUA PURO                  ║
+    ║      Instant TP Steal + Speed Boost + Interface Própria  ║
+    ╚══════════════════════════════════════════════════════════╝
+--]]
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService  = game:GetService("UserInputService")
+local CoreGui           = game:GetService("CoreGui")
+local TweenService      = game:GetService("TweenService")
+local localPlayer       = Players.LocalPlayer
+
+--═══════════════════════════════════════════════════════════════
+-- MÓDULOS DO JOGO
+--═══════════════════════════════════════════════════════════════
+local function safeRequire(getter)
+    local ok, r = pcall(function() return require(getter()) end)
+    return ok and r or nil
+end
+
+local networking = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Networking")
+local EggState   = safeRequire(function() return ReplicatedStorage.Client.EggState end)
+local Assets     = safeRequire(function() return ReplicatedStorage.Data.Assets end)
+local Mutations  = safeRequire(function() return ReplicatedStorage.Shared.Modules.Mutations end)
+
+local function remote(name) return networking:FindFirstChild(name) end
+local function root()
+    local c = localPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+--═══════════════════════════════════════════════════════════════
+-- CONFIG
+--═══════════════════════════════════════════════════════════════
+local CFG = {
+    SpeedCap = 1.15, HopRatio = 1.515, HopMin = 40,
+    HopGap = 0.06, HopGapMin = 0.06, HopGapMax = 0.2, HopRetries = 6,
+    HopLift = 42, LandOffset = 14, LandSettle = 0.08, DropDelay = 0.05,
+    GrabInterval = 0.03, Height = 70, ClimbShare = 0.5,
+    CarryRatio = 0.9, EasyRatio = 1.3,
+}
+
+local SpeedBoost = { Ativo = false, Velocidade = 600, Padrao = 16, TPAovoo = false }
+
+--═══════════════════════════════════════════════════════════════
+-- SHIELD (Humanoid Swap)
+--═══════════════════════════════════════════════════════════════
+local shield = { Original = nil, Clone = nil, Links = {}, Connection = nil, Added = nil }
+
+local function walkSpeed()
+    local c = localPlayer.Character
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+    local s = h and h.WalkSpeed or 16
+    if shield.Original and shield.Original.Health > 0 then
+        s = math.min(s, shield.Original.WalkSpeed)
+    end
+    local ok, r = pcall(function()
+        local stat = localPlayer:FindFirstChild("leaderstats")
+        stat = stat and stat:FindFirstChild("Speed")
+        local util = require(ReplicatedStorage.Shared.Util.TreadmillUtil)
+        return stat and util.SpeedPowerToWalkSpeed(stat.Value) or nil
+    end)
+    if ok and type(r) == "number" and r > 0 then s = math.min(s, r) end
+    return s
+end
+
+local function shieldControls(h)
+    pcall(function()
+        local sc = localPlayer:FindFirstChild("PlayerScripts")
+        local m = sc and sc:FindFirstChild("PlayerModule")
+        if m then
+            local ctl = require(m):GetControls()
+            if type(ctl) == "table" then ctl.humanoid = h end
+        end
+    end)
+end
+
+local function shieldAnimate(c)
+    local a = c and c:FindFirstChild("Animate")
+    if a and a:IsA("LocalScript") then
+        task.spawn(function()
+            a.Enabled = false; task.wait(); a.Enabled = true
+        end)
+    end
+end
+
+local function shieldUnlink()
+    for _, l in ipairs(shield.Links) do pcall(function() l:Disconnect() end) end
+    table.clear(shield.Links)
+end
+
+local groundedStates = {
+    [Enum.HumanoidStateType.Running] = true,
+    [Enum.HumanoidStateType.RunningNoPhysics] = true,
+    [Enum.HumanoidStateType.Landed] = true,
+}
+
+local function grounded(h)
+    if not h or h.Health <= 0 or h.FloorMaterial == Enum.Material.Air then return false end
+    return groundedStates[h:GetState()] == true
+end
+
+local function shieldSwap()
+    local c = localPlayer.Character
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+    if not h or h.Health <= 0 then return end
+    if shield.Clone and shield.Clone.Parent == c then return end
+    if not grounded(h) then return end
+
+    local clone = h:Clone()
+    h.Parent = nil
+    clone.Parent = c
+    workspace.CurrentCamera.CameraSubject = clone
+    shieldControls(clone)
+    shieldAnimate(c)
+    shield.Original = h
+    shield.Clone = clone
+
+    table.insert(shield.Links, h:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+        if clone.Parent ~= nil then clone.WalkSpeed = h.WalkSpeed end
+    end))
+
+    local a1 = h:FindFirstChildOfClass("Animator")
+    local a2 = clone:FindFirstChildOfClass("Animator")
+    if a1 and a2 then
+        table.insert(shield.Links, a1.AnimationPlayed:Connect(function(p)
+            local anim = p.Animation
+            if not anim or clone.Parent == nil then return end
+            local ok, t = pcall(function() return a2:LoadAnimation(anim) end)
+            if not ok or not t then return end
+            pcall(function()
+                t.Priority = p.Priority; t.Looped = p.Looped
+                t:Play(0.05, math.max(p.WeightTarget, 0.01), p.Speed)
+            end)
+            local st
+            st = p.Stopped:Connect(function()
+                st:Disconnect(); pcall(function() t:Stop(0.1) end)
+            end)
+        end))
+    end
+
+    table.insert(shield.Links, clone.Died:Connect(function()
+        shieldUnlink()
+        shield.Original, shield.Clone = nil, nil
+        local cur = localPlayer.Character
+        if cur and h.Parent == nil then
+            h.Parent = cur
+            workspace.CurrentCamera.CameraSubject = h
+            shieldControls(h)
+        end
+        pcall(function() clone:Destroy() end)
+        h.Health = 0
+    end))
+end
+
+local function shieldUndo()
+    shieldUnlink()
+    local c = localPlayer.Character
+    local o, cl = shield.Original, shield.Clone
+    shield.Original, shield.Clone = nil, nil
+    if o and cl and c and o.Parent == nil and cl.Parent == c then
+        o.Parent = c
+        workspace.CurrentCamera.CameraSubject = o
+        shieldControls(o)
+        pcall(function() cl:Destroy() end)
+        shieldAnimate(c)
+    end
+end
+
+local function shieldStart()
+    shieldSwap()
+    local n = 0
+    shield.Connection = RunService.Heartbeat:Connect(function(dt)
+        n += dt
+        local c = localPlayer.Character
+        local miss = not (shield.Clone and c and shield.Clone.Parent == c)
+        if (miss and 0.25 or 3) <= n then
+            n = 0
+            shieldSwap()
+        end
+    end)
+    shield.Added = localPlayer.CharacterAdded:Connect(function(c)
+        shieldUnlink()
+        shield.Original, shield.Clone = nil, nil
+        task.spawn(function()
+            c:WaitForChild("Humanoid", 10)
+            task.wait(1)
+            if shield.Connection and localPlayer.Character == c then
+                shieldSwap()
+            end
+        end)
+    end)
+end
+
+--═══════════════════════════════════════════════════════════════
+-- STATE
+--═══════════════════════════════════════════════════════════════
+local state = {
+    Carrying = false, Uid = nil, Delivered = 0, Busy = false,
+    Cancel = false, Mult = 1, PulledAt = 0, HeldSeen = 0, GuessedDrop = false,
+}
+
+if type(EggState) == "table" and type(EggState.CarryChanged) == "table" then
+    EggState.CarryChanged:Connect(function(arg)
+        local carrying = type(arg) == "table" and arg.IsCarrying == true
+        if carrying and arg.GuardDisabled == true then carrying = false end
+        state.GuessedDrop = false
+        if carrying then state.HeldSeen = os.clock() end
+        if carrying and type(arg.Uid) == "string" then
+            state.Uid = arg.Uid
+            local m = tonumber(arg.SpeedMultiplier)
+            if m and m > 0 then state.Mult = m end
+        end
+        state.Carrying = carrying
+    end)
+end
+
+pcall(function()
+    remote("RE/EggWorld/FieldEggRedeemVerdict").OnClientEvent:Connect(function()
+        state.Delivered = os.clock()
+    end)
+end)
+
+pcall(function()
+    remote("RE/RigSync/Refresh").OnClientEvent:Connect(function(arg)
+        if type(arg) == "table" and arg.Action == "Relocate" then
+            state.PulledAt = os.clock()
+        end
+    end)
+end)
+
+local function takeEgg(uid)
+    if type(uid) == "string" and type(EggState) == "table" and type(EggState.CarryFieldEgg) == "function" then
+        pcall(EggState.CarryFieldEgg, uid)
+    end
+end
+
+local function dropEgg()
+    if type(EggState) == "table" and type(EggState.DropFieldEgg) == "function" then
+        pcall(EggState.DropFieldEgg, "PlayerRequest")
+    end
+end
+
+local function promptNear(pos, radius)
+    local best, bd = nil, radius
+    for _, ch in ipairs(workspace:GetChildren()) do
+        if ch.Name == "SmartPromptPart" and ch:IsA("BasePart") then
+            local p = ch:FindFirstChild("CarryAreaEgg")
+            if p and p:IsA("ProximityPrompt") then
+                local d = (ch.Position - pos).Magnitude
+                if d < bd then best, bd = p, d end
+            end
+        end
+    end
+    return best
+end
+
+local function snapshot()
+    local list = {}
+    local ok, r = pcall(function()
+        return remote("RF/EggWorld/AskFieldEggSnapshot"):InvokeServer()
+    end)
+    local recs = ok and type(r) == "table" and r.Records or nil
+    if type(recs) ~= "table" then return list end
+    for _, rec in pairs(recs) do
+        if type(rec) == "table" and type(rec.Uid) == "string"
+           and (rec.State == "Slot" or rec.State == "Dropped")
+           and typeof(rec.BottomCFrame) == "CFrame" then
+            list[#list + 1] = rec
+        end
+    end
+    return list
+end
+
+local function eggPosition(uid)
+    for _, rec in ipairs(snapshot()) do
+        if rec.Uid == uid then return rec.BottomCFrame.Position end
+    end
+    return nil
+end
+
+local function describe(rec)
+    local dir = type(Assets) == "table" and Assets.Directory or nil
+    local entry = type(dir) == "table" and dir[tostring(rec.AssetCategory)] or nil
+    local info = { Uid = rec.Uid, Name = tostring(rec.AssetCategory), Icon = "", Value = 0 }
+
+    if type(entry) == "table" then
+        info.Name = tostring(entry.DisplayName or rec.AssetCategory)
+        local icon = entry.Icon
+        if icon ~= nil and tostring(icon) ~= "" then
+            icon = tostring(icon)
+            info.Icon = tonumber(icon) and ("rbxassetid://" .. icon) or icon
+        end
+        local scale = tonumber(rec.AssetScale) or 1
+        local factor = scale > 5 and (scale / 5) ^ 1.2 * 19.637875755794113 or scale ^ 1.85
+        local mut = 1
+        if type(Mutations) == "table" and type(Mutations.EarningsFor) == "function" then
+            local okM, resM = pcall(Mutations.EarningsFor, type(rec.Mutations) == "table" and rec.Mutations or {})
+            if okM and type(resM) == "number" then mut = resM end
+        end
+        info.Value = (tonumber(entry.EarningRate) or 0) * factor * mut
+    end
+    return info
+end
+
+--═══════════════════════════════════════════════════════════════
+-- GRAB
+--═══════════════════════════════════════════════════════════════
+local function grab(uid, timeout)
+    local waited, since = 0, 1
+    while not state.Carrying and waited < timeout and not state.Cancel do
+        local r = root()
+        local egg = eggPosition(uid)
+        local dt = math.max(RunService.Heartbeat:Wait(), 1/240)
+        waited += dt
+        since += dt
+        if r and egg then
+            local delta = egg - r.Position
+            if delta.Magnitude > 2 then
+                local pace = math.max(walkSpeed() * CFG.SpeedCap, 16)
+                local v = delta / math.max(0.08, dt)
+                if v.Magnitude > pace then v = v.Unit * pace end
+                pcall(function()
+                    r.AssemblyLinearVelocity = v + Vector3.new(0, workspace.Gravity * dt * 0.5, 0)
+                    r.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+            if since >= CFG.GrabInterval then
+                since = 0
+                local prompt = promptNear(egg - Vector3.new(0, 3, 0), 10)
+                if prompt and typeof(fireproximityprompt) == "function" then
+                    pcall(function() prompt.HoldDuration = 0 end)
+                    pcall(fireproximityprompt, prompt)
+                end
+                task.spawn(takeEgg, uid)
+            end
+        elseif since >= CFG.GrabInterval then
+            since = 0
+            task.spawn(takeEgg, uid)
+        end
+    end
+    local r = root()
+    if r then pcall(function() r.AssemblyLinearVelocity = Vector3.zero end) end
+    return state.Carrying and state.Uid == uid
+end
+
+--═══════════════════════════════════════════════════════════════
+-- LINE / HOME / INSTANT TP
+--═══════════════════════════════════════════════════════════════
+local function lineInfo()
+    local w = workspace:FindFirstChild("World") or workspace:FindFirstChild("__OBJECTS")
+    w = w and w:FindFirstChild("Areas")
+    w = w and w:FindFirstChild("SeparationLine")
+    local ok = w and w:IsA("BasePart")
+    return ok and w.Position.X or 552.2, ok and w.Position.Y or 67.67
+end
+
+local function homePoint()
+    for _, def in ipairs({
+        { { "GearGiver_Slap", "Podium" }, Vector3.new(-16.415, 21.072, -6.106) },
+        { { "World", "Machines", "RiftMachine", "Rift", "Meshes/VoidPortal_Cube.003" }, Vector3.new(-26.776, 1.75, 18.665) },
+        { { "__OBJECTS", "Machines", "RiftMachine", "Rift", "Meshes/VoidPortal_Cube.003" }, Vector3.new(-26.776, 1.75, 18.665) },
+    }) do
+        local n = workspace
+        for _, name in ipairs(def[1]) do n = n and n:FindFirstChild(name) or nil end
+        if n and n:IsA("BasePart") then
+            return n.CFrame:PointToWorldSpace(def[2])
+        end
+    end
+    return Vector3.new(528.7, 70.57, -364.11)
+end
+
+local function place(pos)
+    local r = root()
+    if not r then return end
+    pcall(function()
+        r.CFrame = CFrame.new(pos) * CFrame.Angles(0, math.rad(90), 0)
+        r.AssemblyLinearVelocity = Vector3.zero
+        r.AssemblyAngularVelocity = Vector3.zero
+    end)
+end
+
+local function groundY(pos, fallback)
+    local y = fallback
+    pcall(function()
+        local p = RaycastParams.new()
+        p.FilterType = Enum.RaycastFilterType.Exclude
+        p.FilterDescendantsInstances = { localPlayer.Character }
+        p.IgnoreWater = true
+        local hit = workspace:Raycast(pos + Vector3.new(0, 60, 0), Vector3.new(0, -140, 0), p)
+        if hit and hit.Material ~= Enum.Material.Water and math.abs(hit.Position.Y - fallback) < 40 then
+            y = hit.Position.Y + 3.5
+        end
+    end)
+    return y
+end
+
+local function carrySpeed(distance)
+    local ws = walkSpeed()
+    local base = ws * math.min(CFG.CarryRatio, CFG.SpeedCap) * state.Mult
+    local fast = base * 1.5
+    local excess = 5.5 * base
+    local limit = fast
+    if distance and distance > excess then
+        limit = math.min(fast, base * distance / (distance - excess))
+    end
+    return math.min(math.max(math.min(base * CFG.EasyRatio, limit), base), math.max(ws * CFG.SpeedCap, base))
+end
+
+local function runHome(lineX, laneZ)
+    local started = os.clock()
+    local home = homePoint()
+    local checkpoint = lineX - 7
+    local height = CFG.Height
+    local share = math.clamp(CFG.ClimbShare, 0.1, 0.9)
+    local descent = height * math.sqrt(1 - share * share) / share
+    local c = localPlayer.Character
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+    if h then h.PlatformStand = false end
+
+    local r = root()
+    if r and c and height > 0.5 and home.Y + height - 2 > r.Position.Y then
+        pcall(function()
+            c:PivotTo(CFrame.new(Vector3.new(r.Position.X, home.Y + height, r.Position.Z)) * r.CFrame.Rotation)
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+
+    local start = root()
+    local speed = carrySpeed(start and (Vector3.new(start.Position.X - home.X, 0, start.Position.Z - home.Z).Magnitude + math.max(0, height) * 2) or nil)
+
+    local last = os.clock()
+    local timeout = 0
+    while state.Carrying and state.Delivered < started and not state.Cancel and timeout < 25 do
+        r = root()
+        if not r then return false end
+        local now = os.clock()
+        local dt = math.max(now - last, 1/240)
+        last = now
+        timeout += dt
+
+        local toHome = r.Position.X <= checkpoint + 2
+        local target = toHome and home or Vector3.new(checkpoint, home.Y, laneZ)
+        if toHome and Vector3.new(home.X - r.Position.X, 0, home.Z - r.Position.Z).Magnitude < 2 then break end
+
+        local flat = Vector3.new(target.X - r.Position.X, 0, target.Z - r.Position.Z)
+        local remaining = toHome and 0 or math.max(0, r.Position.X - checkpoint)
+        local wantY = home.Y + height
+        if toHome or remaining <= descent then
+            wantY = home.Y + height * math.clamp(remaining / math.max(descent, 1), 0, 1)
+        end
+        local vy = math.clamp((wantY - r.Position.Y) / 0.12, -speed * share, speed * share)
+        local horiz = math.sqrt(math.max(speed * speed - vy * vy, 0))
+        local v = flat.Magnitude > 0.01 and flat.Unit * math.min(horiz, flat.Magnitude / 0.05) or Vector3.zero
+        pcall(function()
+            r.AssemblyLinearVelocity = Vector3.new(v.X, vy, v.Z)
+        end)
+        RunService.Heartbeat:Wait()
+    end
+
+    if h then pcall(function() h:Move(Vector3.zero, false) end) end
+
+    local settle = 0
+    while settle < 2 and state.Delivered < started and state.Carrying and not state.Cancel do
+        settle += RunService.Heartbeat:Wait()
+    end
+    if state.Carrying and state.Delivered < started and not state.Cancel then
+        task.wait(0.2)
+        dropEgg()
+        local waited = 0
+        while state.Delivered < started and waited < 1 do
+            waited += RunService.Heartbeat:Wait()
+        end
+    end
+    return state.Delivered >= started
+end
+
+local function instantTP(uid)
+    local started = os.clock()
+    local lineX, lineY = lineInfo()
+    local r = root()
+    if not r then return false end
+    local laneZ = math.clamp(r.Position.Z, -425, -300)
+    local landing = Vector3.new(lineX + CFG.LandOffset, lineY + 3.35, laneZ)
+
+    local hopStep = math.max(walkSpeed() * CFG.HopRatio, CFG.HopMin)
+    local hopY = r.Position.Y + CFG.HopLift
+    local x = r.Position.X
+    local retries = 0
+
+    while x - hopStep > landing.X and not state.Cancel do
+        if not state.Carrying then
+            local egg = eggPosition(uid)
+            if not egg then break end
+            place(egg + Vector3.new(0, 3, 0))
+            grab(uid, 3)
+            local cur = root()
+            if cur then x = math.min(x, cur.Position.X) end
+            continue
+        end
+
+        local nextX = x - hopStep
+        local pulledBefore = state.PulledAt
+        local held = 0
+        while held < CFG.HopGap do
+            place(Vector3.new(nextX, hopY, laneZ))
+            held += RunService.Heartbeat:Wait()
+        end
+
+        local check = root()
+        local pulled = state.PulledAt > pulledBefore or (check ~= nil and (check.Position.X - nextX > 10 or check.AssemblyLinearVelocity.Magnitude > 150))
+        if pulled and state.Carrying and not state.Cancel then
+            retries += 1
+            CFG.HopGap = math.min(CFG.HopGapMax, CFG.HopGap + 0.02)
+            if retries > CFG.HopRetries then break end
+            local settle = 0
+            while settle < 0.12 and not state.Cancel do
+                place(Vector3.new(x, hopY, laneZ))
+                settle += RunService.Heartbeat:Wait()
+            end
+        else
+            x = nextX
+            CFG.HopGap = math.max(CFG.HopGapMin, CFG.HopGap - 0.01)
+        end
+    end
+
+    landing = Vector3.new(landing.X, groundY(landing, landing.Y), landing.Z)
+    local function land()
+        local cur = root()
+        if cur and cur.Position.X <= landing.X + 1 and cur.Position.Y > landing.Y - 25 then
+            pcall(function() cur.AssemblyLinearVelocity = Vector3.zero end)
+            return
+        end
+        place(landing)
+    end
+    land()
+
+    if state.Carrying and not state.Cancel then
+        local d = 0
+        while d < CFG.DropDelay do d += RunService.Heartbeat:Wait() end
+        dropEgg()
+        local w = 0
+        while state.Carrying and w < 1 and not state.Cancel do w += RunService.Heartbeat:Wait() end
+
+        local ok = grab(uid, 3)
+        if not ok and not state.Cancel then
+            local egg = eggPosition(uid)
+            if egg then
+                place(egg + Vector3.new(0, 3, 0))
+                grab(uid, 3)
+            end
+        end
+    end
+
+    local ok2 = false
+    if state.Carrying then
+        ok2 = runHome(lineX, laneZ)
+    end
+    return ok2 or state.Delivered >= started
+end
+
+local function stealAndDeliver(uid)
+    if state.Busy then return end
+    state.Busy = true
+    state.Cancel = false
+    task.spawn(function()
+        local ok, err = pcall(function()
+            local egg = eggPosition(uid)
+            if not egg then return end
+
+            if SpeedBoost.TPAovoo then
+                local r = root()
+                if r then
+                    pcall(function()
+                        r.CFrame = CFrame.new(egg + Vector3.new(0, 3, 0))
+                        r.AssemblyLinearVelocity = Vector3.zero
+                        r.AssemblyAngularVelocity = Vector3.zero
+                    end)
+                end
+            end
+
+            if state.Carrying and state.Uid ~= uid then
+                dropEgg()
+                local w = 0
+                while state.Carrying and w < 1 do w += RunService.Heartbeat:Wait() end
+            end
+
+            local r = root()
+            if r and not SpeedBoost.TPAovoo then
+                local dx = egg.X - r.Position.X
+                local dz = egg.Z - r.Position.Z
+                if math.sqrt(dx*dx + dz*dz) > 3 then
+                    place(egg + Vector3.new(0, 3, 0))
+                end
+            end
+
+            if not grab(uid, 4) then return end
+            instantTP(uid)
+        end)
+        state.Busy = false
+    end)
+end
+
+--═══════════════════════════════════════════════════════════════
+-- INTERFACE 100% LUA PURO (sem Rayfield)
+--═══════════════════════════════════════════════════════════════
+local Cores = {
+    Fundo = Color3.fromRGB(10, 8, 15),
+    Painel = Color3.fromRGB(18, 12, 28),
+    Roxo = Color3.fromRGB(138, 43, 226),
+    RoxoClaro = Color3.fromRGB(180, 120, 255),
+    Texto = Color3.fromRGB(235, 230, 245),
+    Verde = Color3.fromRGB(80, 255, 140),
+    Vermelho = Color3.fromRGB(255, 80, 80),
+    Cinza = Color3.fromRGB(120, 120, 130),
+}
+
+local function criar(class, props, children)
+    local obj = Instance.new(class)
+    for k, v in pairs(props or {}) do pcall(function() obj[k] = v end) end
+    for _, c in ipairs(children or {}) do pcall(function() c.Parent = obj end) end
+    return obj
+end
+
+-- Container principal
+local gui = criar("ScreenGui", {
+    Name = "ZazakHub",
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    IgnoreGuiInset = true,
+})
+gui.Parent = CoreGui
+
+-- Janela principal
+local painel = criar("Frame", {
+    Name = "Painel",
+    Size = UDim2.new(0, 260, 0, 380),
+    Position = UDim2.new(0, 30, 0, 100),
+    BackgroundColor3 = Cores.Painel,
+    BorderSizePixel = 0,
+    Active = true,
+    Draggable = true,
+}, {
+    criar("UICorner", {CornerRadius = UDim.new(0, 12)}),
+    criar("UIStroke", {Color = Cores.Roxo, Thickness = 2}),
+})
+painel.Parent = gui
+
+-- Topo
+local topo = criar("Frame", {
+    Size = UDim2.new(1, 0, 0, 36),
+    BackgroundColor3 = Cores.Roxo,
+    BorderSizePixel = 0,
+}, {
+    criar("UICorner", {CornerRadius = UDim.new(0, 12)}),
+    criar("TextLabel", {
+        Size = UDim2.new(1, -10, 1, 0),
+        Position = UDim2.new(0, 12, 0, 0),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBlack,
+        TextSize = 15,
+        TextColor3 = Color3.new(1, 1, 1),
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "ZAZAK HUB",
+    }),
+    criar("TextButton", {
+        Name = "Fechar",
+        Size = UDim2.new(0, 26, 0, 26),
+        Position = UDim2.new(1, -32, 0, 5),
+        BackgroundColor3 = Cores.Vermelho,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+        TextColor3 = Color3.new(1, 1, 1),
+        Text = "✕",
+    }, {
+        criar("UICorner", {CornerRadius = UDim.new(0, 6)}),
+    }),
+})
+topo.Parent = painel
+
+-- Container
+local container = criar("Frame", {
+    Size = UDim2.new(1, 0, 1, -36),
+    Position = UDim2.new(0, 0, 0, 36),
+    BackgroundTransparency = 1,
+})
+container.Parent = painel
+
+-- Função pra criar botão toggle
+local function criarToggle(nome, y, valorInicial)
+    local btn = criar("TextButton", {
+        Size = UDim2.new(1, -20, 0, 30),
+        Position = UDim2.new(0, 10, 0, y),
+        BackgroundColor3 = Cores.Fundo,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = Cores.Texto,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "  " .. nome,
+    }, {
+        criar("UICorner", {CornerRadius = UDim.new(0, 6)}),
+        criar("UIStroke", {Color = Cores.Roxo, Thickness = 1}),
+        criar("TextLabel", {
+            Name = "Status",
+            Size = UDim2.new(0, 50, 1, 0),
+            Position = UDim2.new(1, -55, 0, 0),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold,
+            TextSize = 12,
+            TextXAlignment = Enum.TextXAlignment.Right,
+            Text = valorInicial and "[ON]" or "[OFF]",
+            TextColor3 = valorInicial and Cores.Verde or Cores.Cinza,
+        }),
+    })
+    btn.Parent = container
+    return btn
+end
+
+local function atualizarToggle(btn, valor)
+    local st = btn:FindFirstChild("Status")
+    if st then
+        st.Text = valor and "[ON]" or "[OFF]"
+        st.TextColor3 = valor and Cores.Verde or Cores.Cinza
+    end
+end
+
+-- Label da lista de ovos
+criar("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 22),
+    Position = UDim2.new(0, 10, 0, 8),
+    BackgroundColor3 = Cores.Fundo,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    TextColor3 = Cores.RoxoClaro,
+    Text = "LISTA DE OVOS",
+}, {
+    criar("UICorner", {CornerRadius = UDim.new(0, 6)}),
+}).Parent = container
+
+-- Scrolling de ovos
+local scroll = criar("ScrollingFrame", {
+    Size = UDim2.new(1, -20, 0, 130),
+    Position = UDim2.new(0, 10, 0, 34),
+    BackgroundColor3 = Cores.Fundo,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = Cores.Roxo,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, {
+    criar("UICorner", {CornerRadius = UDim.new(0, 6)}),
+    criar("UIListLayout", {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder}),
+    criar("UIPadding", {PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4)}),
+})
+scroll.Parent = container
+
+-- Botões abaixo da lista
+local btnRefresh = criar("TextButton", {
+    Size = UDim2.new(0.45, -15, 0, 30),
+    Position = UDim2.new(0, 10, 0, 172),
+    BackgroundColor3 = Cores.Roxo,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    TextColor3 = Color3.new(1, 1, 1),
+    Text = "Atualizar",
+}, {criar("UICorner", {CornerRadius = UDim.new(0, 6)})})
+btnRefresh.Parent = container
+
+local btnSteal = criar("TextButton", {
+    Size = UDim2.new(0.55, -15, 0, 30),
+    Position = UDim2.new(0.45, 5, 0, 172),
+    BackgroundColor3 = Cores.Verde,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBlack,
+    TextSize = 13,
+    TextColor3 = Color3.new(0, 0, 0),
+    Text = "STEAL",
+}, {criar("UICorner", {CornerRadius = UDim.new(0, 6)})})
+btnSteal.Parent = container
+
+-- Label Speed Boost
+criar("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 22),
+    Position = UDim2.new(0, 10, 0, 210),
+    BackgroundColor3 = Cores.Fundo,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    TextColor3 = Cores.RoxoClaro,
+    Text = "SPEED BOOST",
+}, {
+    criar("UICorner", {CornerRadius = UDim.new(0, 6)}),
+}).Parent = container
+
+-- Toggle Speed Boost
+local btnSpeedToggle = criarToggle("Speed Boost [Q]", 236, false)
+
+-- Slider Boost Speed
+local sliderFrame = criar("Frame", {
+    Size = UDim2.new(1, -20, 0, 40),
+    Position = UDim2.new(0, 10, 0, 270),
+    BackgroundColor3 = Cores.Fundo,
+    BorderSizePixel = 0,
+}, {
+    criar("UICorner", {CornerRadius = UDim.new(0, 6)}),
+    criar("UIStroke", {Color = Cores.Roxo, Thickness = 1}),
+})
+sliderFrame.Parent = container
+
+criar("TextLabel", {
+    Size = UDim2.new(0.6, 0, 0, 18),
+    Position = UDim2.new(0, 8, 0, 2),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    TextColor3 = Cores.Texto,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Text = "Boost Speed",
+}).Parent = sliderFrame
+
+local valorLabel = criar("TextLabel", {
+    Size = UDim2.new(0.35, -8, 0, 18),
+    Position = UDim2.new(0.6, 4, 0, 2),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    TextColor3 = Cores.Verde,
+    TextXAlignment = Enum.TextXAlignment.Right,
+    Text = "600",
+})
+valorLabel.Parent = sliderFrame
+
+local track = criar("Frame", {
+    Size = UDim2.new(1, -16, 0, 8),
+    Position = UDim2.new(0, 8, 0, 24),
+    BackgroundColor3 = Color3.fromRGB(40, 30, 55),
+    BorderSizePixel = 0,
+}, {criar("UICorner", {CornerRadius = UDim.new(1, 0)})})
+track.Parent = sliderFrame
+
+local fill = criar("Frame", {
+    Size = UDim2.new(0.6, 0, 1, 0),
+    BackgroundColor3 = Cores.Verde,
+    BorderSizePixel = 0,
+}, {criar("UICorner", {CornerRadius = UDim.new(1, 0)})})
+fill.Parent = track
+
+local knob = criar("Frame", {
+    Size = UDim2.new(0, 16, 0, 16),
+    Position = UDim2.new(0.6, -8, 0.5, -8),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+    ZIndex = 2,
+}, {criar("UICorner", {CornerRadius = UDim.new(1, 0)})})
+knob.Parent = track
+
+-- Lógica do slider (drag)
+local draggingSlider = false
+local function updateSlider(input)
+    local posX = input.Position.X
+    local trackAbs = track.AbsolutePosition.X
+    local trackSize = track.AbsoluteSize.X
+    if trackSize <= 0 then return end
+    local pct = math.clamp((posX - trackAbs) / trackSize, 0, 1)
+    local valor = math.floor(16 + (1000 - 16) * pct)
+    SpeedBoost.Velocidade = valor
+    valorLabel.Text = tostring(valor)
+    fill.Size = UDim2.new(pct, 0, 1, 0)
+    knob.Position = UDim2.new(pct, -8, 0.5, -8)
+    if SpeedBoost.Ativo then
+        local c = localPlayer.Character
+        local h = c and c:FindFirstChildOfClass("Humanoid")
+        if h then h.WalkSpeed = valor end
+    end
+end
+
+track.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        draggingSlider = true
+        updateSlider(input)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if draggingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        updateSlider(input)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        draggingSlider = false
+    end
+end)
+
+-- Lista de ovos
+local selectedUid = nil
+local ovosLista = {}
+
+local function limparLista()
+    for _, row in ipairs(ovosLista) do
+        pcall(function() row:Destroy() end)
+    end
+    ovosLista = {}
+end
+
+local function atualizarLista()
+    limparLista()
+    local infos = {}
+    for _, rec in ipairs(snapshot()) do
+        infos[#infos + 1] = describe(rec)
+    end
+    table.sort(infos, function(a, b) return a.Value > b.Value end)
+
+    for i, info in ipairs(infos) do
+        local row = criar("TextButton", {
+            Size = UDim2.new(1, -8, 0, 26),
+            BackgroundColor3 = i % 2 == 0 and Cores.Painel or Cores.Fundo,
+            BorderSizePixel = 0,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
+            TextColor3 = Cores.Texto,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Text = "  " .. info.Name,
+            LayoutOrder = i,
+        }, {criar("UICorner", {CornerRadius = UDim.new(0, 4)})})
+        row.Parent = scroll
+
+        row.MouseButton1Click:Connect(function()
+            selectedUid = info.Uid
+            for _, r in ipairs(ovosLista) do
+                r.BackgroundColor3 = r == row and Cores.Roxo or (r.LayoutOrder % 2 == 0 and Cores.Painel or Cores.Fundo)
+            end
+        end)
+
+        table.insert(ovosLista, row)
+    end
+end
+
+-- Toggle Speed Boost
+local speedAtivo = false
+btnSpeedToggle.MouseButton1Click:Connect(function()
+    speedAtivo = not speedAtivo
+    SpeedBoost.Ativo = speedAtivo
+    atualizarToggle(btnSpeedToggle, speedAtivo)
+    local c = localPlayer.Character
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+    if h then
+        h.WalkSpeed = speedAtivo and SpeedBoost.Velocidade or SpeedBoost.Padrao
+    end
+end)
+
+-- Atalho Q
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.Q then
+        speedAtivo = not speedAtivo
+        SpeedBoost.Ativo = speedAtivo
+        atualizarToggle(btnSpeedToggle, speedAtivo)
+        local c = localPlayer.Character
+        local h = c and c:FindFirstChildOfClass("Humanoid")
+        if h then
+            h.WalkSpeed = speedAtivo and SpeedBoost.Velocidade or SpeedBoost.Padrao
+        end
+    end
+end)
+
+-- Loop manter velocidade
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        if SpeedBoost.Ativo then
+            local c = localPlayer.Character
+            local h = c and c:FindFirstChildOfClass("Humanoid")
+            if h and h.WalkSpeed ~= SpeedBoost.Velocidade then
+                h.WalkSpeed = SpeedBoost.Velocidade
+            end
+        end
+    end
+end)
+
+-- Botões
+btnRefresh.MouseButton1Click:Connect(atualizarLista)
+
+btnSteal.MouseButton1Click:Connect(function()
+    if state.Busy then
+        state.Cancel = true
+        return
+    end
+    if not selectedUid then return end
+    stealAndDeliver(selectedUid)
+end)
+
+topo.Fechar.MouseButton1Click:Connect(function()
+    gui.Enabled = false
+end)
+
+--═══════════════════════════════════════════════════════════════
+-- INICIAR
+--═══════════════════════════════════════════════════════════════
+shieldStart()
+atualizarLista()
+
+print("[Zazak Hub] Carregado - Lua puro")
